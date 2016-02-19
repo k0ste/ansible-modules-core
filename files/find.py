@@ -3,6 +3,7 @@
 
 # (c) 2014, Ruggero Marchei <ruggero.marchei@daemonzone.net>
 # (c) 2015, Brian Coca <bcoca@ansible.com>
+# (c) 2016, Konstantin Shalygin <k0ste@k0ste.ru>
 #
 # This file is part of Ansible
 #
@@ -52,11 +53,20 @@ options:
             - The patterns restrict the list of files to be returned to those whose basenames match at
               least one of the patterns specified. Multiple patterns can be specified using a list.
         aliases: ['pattern']
+    excludes:
+        required: false
+        default: '*'
+        description:
+            - One or more (shell or regex) patterns, which type is controlled by C(use_regex) option.
+            - Excludes is a patterns should not be returned in list. Multiple patterns can be specified
+              using a list.
+        aliases: ['exclude']
+        version_added: "2.3"
     contains:
         required: false
         default: null
         description:
-            - One or more regex patterns which should be matched against the file content
+            - One or more regex patterns which should be matched against the file content.
     paths:
         required: true
         aliases: [ "name", "path" ]
@@ -65,8 +75,8 @@ options:
     file_type:
         required: false
         description:
-            - Type of file to select
-            - The 'link' and 'any' choices were added in version 2.3
+            - Type of file to select.
+            - The 'link' and 'any' choices were added in version 2.3.
         choices: [ "file", "directory", "link", "any" ]
         default: "file"
     recurse:
@@ -101,19 +111,19 @@ options:
         default: "False"
         choices: [ True, False ]
         description:
-            - Set this to true to follow symlinks in path for systems with python 2.6+
+            - Set this to true to follow symlinks in path for systems with Python 2.6+.
     get_checksum:
         required: false
         default: "False"
         choices: [ True, False ]
         description:
-            - Set this to true to retrieve a file's sha1 checksum
+            - Set this to true to retrieve a file's sha1 checksum.
     use_regex:
         required: false
         default: "False"
         choices: [ True, False ]
         description:
-            - If false the patterns are file globs (shell) if true they are python regexes
+            - If false the patterns are file globs (shell) if true they are python regexes.
 '''
 
 
@@ -140,13 +150,29 @@ EXAMPLES = '''
 
 # find /var/log files equal or greater than 10 megabytes ending with .old or .log.gz
 - find:
-    paths: "/var/tmp"
+    paths: "/var/log"
     patterns: "*.old,*.log.gz"
     size: "10m"
 
+# find /var/log all directories, exclude nginx and mysql
+- find:
+    paths: "/var/log"
+    recurse: "no"
+    file_type: "directory"
+    excludes: "nginx,mysql"
+
+# find /var/log all ".log" files, exclude 'snmpd.log' and 'ntp.log' via regex
+- find:
+    paths: "/var/log"
+    recurse: "no"
+    file_type: "file"
+    patterns: "^(.*)\.log$"
+    excludes: "^(snmpd|ntp)\.log$"
+    use_regex: True
+
 # find /var/log files equal or greater than 10 megabytes ending with .old or .log.gz via regex
 - find:
-    paths: "/var/tmp"
+    paths: "/var/log"
     patterns: "^.*?\.(?:old|log\.gz)$"
     size: "10m"
     use_regex: True
@@ -179,25 +205,44 @@ examined:
     sample: 34
 '''
 
-def pfilter(f, patterns=None, use_regex=False):
+def pfilter(f, patterns=None, excludes=None, use_regex=False):
     '''filter using glob patterns'''
 
-    if patterns is None:
+    if patterns is None and excludes is None:
         return True
 
     if use_regex:
-        for p in patterns:
-            r =  re.compile(p)
-            if r.match(f):
-                return True
-    else:
+        if patterns != ['*'] and excludes == ['*']:
+            for p in patterns:
+                r = re.compile(p)
+                if r.match(f):
+                    return True
 
-        for p in patterns:
-            if fnmatch.fnmatch(f, p):
-                return True
+        elif patterns != ['*'] and excludes != ['*']:
+            for p in patterns:
+                r = re.compile(p)
+                if r.match(f):
+                    for e in excludes:
+                        r = re.compile(e)
+                        if r.match(f):
+                            return False
+                    return True
+
+    else:
+        if patterns != ['*'] and excludes == ['*']:
+            for p in patterns:
+                if fnmatch.fnmatch(f, p):
+                    return True
+
+        elif patterns != ['*'] and excludes != ['*']:
+            for p in patterns:
+                if fnmatch.fnmatch(f, p):
+                    for e in excludes:
+                        if fnmatch.fnmatch(f, e):
+                            return False
+                    return True
 
     return False
-
 
 def agefilter(st, now, age, timestamp):
     '''filter files older than age'''
@@ -207,7 +252,6 @@ def agefilter(st, now, age, timestamp):
 
         return True
     return False
-
 
 def sizefilter(st, size):
     '''filter files greater than size'''
@@ -231,7 +275,7 @@ def contentfilter(fsname, pattern):
                f.close()
                return True
 
-       f.close() 
+       f.close()
     except:
        pass
 
@@ -269,12 +313,12 @@ def statinfo(st):
         'isgid'    : bool(st.st_mode & stat.S_ISGID),
     }
 
-
 def main():
     module = AnsibleModule(
         argument_spec = dict(
             paths         = dict(required=True, aliases=['name','path'], type='list'),
             patterns      = dict(default=['*'], type='list', aliases=['pattern']),
+            excludes      = dict(default=['*'], type='list', aliases=['exclude']),
             contains      = dict(default=None, type='str'),
             file_type     = dict(default="file", choices=['file', 'directory', 'link', 'any'], type='str'),
             age           = dict(default=None, type='str'),
@@ -339,20 +383,23 @@ def main():
 
                     r = {'path': fsname}
                     if params['file_type'] == 'any':
-                        if pfilter(fsobj, params['patterns'], params['use_regex']) and agefilter(st, now, age, params['age_stamp']):
+                        if pfilter(fsobj, params['patterns'], params['excludes'], params['use_regex']) and \
+                           agefilter(st, now, age, params['age_stamp']):
+
                             r.update(statinfo(st))
                             filelist.append(r)
+
                     elif stat.S_ISDIR(st.st_mode) and params['file_type'] == 'directory':
-                        if pfilter(fsobj, params['patterns'], params['use_regex']) and agefilter(st, now, age, params['age_stamp']):
+                        if pfilter(fsobj, params['patterns'], params['excludes'], params['use_regex']) and \
+                           agefilter(st, now, age, params['age_stamp']):
 
                             r.update(statinfo(st))
                             filelist.append(r)
 
                     elif stat.S_ISREG(st.st_mode) and params['file_type'] == 'file':
-                        if pfilter(fsobj, params['patterns'], params['use_regex']) and \
+                        if pfilter(fsobj, params['patterns'], params['excludes'], params['use_regex']) and \
                            agefilter(st, now, age, params['age_stamp']) and \
-                           sizefilter(st, size) and \
-                           contentfilter(fsname, params['contains']):
+                           sizefilter(st, size) and contentfilter(fsname, params['contains']):
 
                             r.update(statinfo(st))
                             if params['get_checksum']:
@@ -360,7 +407,9 @@ def main():
                             filelist.append(r)
 
                     elif stat.S_ISLNK(st.st_mode) and params['file_type'] == 'link':
-                        if pfilter(fsobj, params['patterns'], params['use_regex']) and agefilter(st, now, age, params['age_stamp']):
+                        if pfilter(fsobj, params['patterns'], params['excludes'], params['use_regex']) and \
+                           agefilter(st, now, age, params['age_stamp']):
+
                             r.update(statinfo(st))
                             filelist.append(r)
 
